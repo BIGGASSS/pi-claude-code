@@ -642,7 +642,11 @@ export function rewriteInitialRequest(
   };
   let messages = payload.messages;
   const first = messages?.[0];
-  if (first?.role !== "user" || !Array.isArray(first.content)) {
+  // Claude Code can serialize replayed text-only user content as a string.
+  if (
+    first?.role !== "user" ||
+    (!Array.isArray(first.content) && typeof first.content !== "string")
+  ) {
     throw new Error("Claude Code request is missing its initial user message");
   }
   if (prefix) first.content = [...structuredClone(prefix), ...structuredClone(canonicalContent)];

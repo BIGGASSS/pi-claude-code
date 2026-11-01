@@ -85,6 +85,58 @@ test("stabilizes Claude Code's native replay reminders and cache breakpoint", ()
   );
 });
 
+for (const { name, prefix } of [
+  { name: "a saved reminder", prefix: [{ type: "text", text: "account reminder" }] },
+  { name: "an empty saved prefix", prefix: [] },
+  { name: "no saved prefix", prefix: undefined },
+]) {
+  test(`rewrites string initial user content with ${name}`, () => {
+    const canonical = [{ type: "text", text: "inspect" }];
+    const cache = { type: "ephemeral", ttl: "1h" };
+    const initialSystemMessages = [
+      { role: "system", content: [{ type: "text", text: "saved environment", cache_control: cache }] },
+    ];
+    const nativeContent = "native reminder\ninspect";
+    const toolCall = { type: "tool_use", id: "t1", name: "mcp__pi__read", input: { path: "fixture.txt" } };
+    const toolResult = { type: "tool_result", tool_use_id: "t1", content: "fixture contents", is_error: false };
+    const body = Buffer.from(JSON.stringify({
+      messages: [
+        { role: "user", content: nativeContent },
+        { role: "system", content: "changed environment" },
+        { role: "assistant", content: [toolCall] },
+        { role: "user", content: [toolResult] },
+      ],
+    }));
+    const metadata = structuredClone({ prefix, canonical, initialSystemMessages });
+
+    const rewritten = JSON.parse(
+      rewriteInitialRequest(body, prefix, canonical, initialSystemMessages).toString("utf8"),
+    );
+    assert.deepEqual(rewritten.messages, [
+      { role: "user", content: prefix ? [...prefix, ...canonical] : nativeContent },
+      ...initialSystemMessages,
+      { role: "assistant", content: [toolCall] },
+      { role: "user", content: [{ ...toolResult, cache_control: cache }] },
+    ]);
+    assert.deepEqual({ prefix, canonical, initialSystemMessages }, metadata);
+  });
+}
+
+test("rejects replay requests without a valid initial user message", () => {
+  for (const messages of [
+    undefined,
+    [],
+    [{ role: "assistant", content: "not a user" }],
+    ...[undefined, null, false, 42, {}].map((content) => [{ role: "user", content }]),
+  ]) {
+    assert.throws(
+      () => rewriteInitialRequest(Buffer.from(JSON.stringify({ messages })), [], [], undefined),
+      /Claude Code request is missing its initial user message/,
+      JSON.stringify(messages),
+    );
+  }
+});
+
 test("injects native system history at assistant boundaries", () => {
   const body = {
     system: [
