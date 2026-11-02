@@ -68,6 +68,11 @@ These environment variables are optional:
   (default: `claude`).
 - `PI_CLAUDE_CODE_CONFIG_DIR`: Claude Code config directory to use. The
   extension passes it to Claude Code as `CLAUDE_CONFIG_DIR`.
+- `PI_CLAUDE_CODE_ENTRYPOINT`: identifier for Claude Code subprocesses
+  (default: `pi-claude-code`). The extension sets `CLAUDE_CODE_ENTRYPOINT` to
+  this value for turns, model discovery, and auth checks, replacing any inherited
+  host identifier. It does not change your shell environment or standalone
+  Claude Code sessions.
 
 ## Usage and billing
 

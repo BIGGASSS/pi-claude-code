@@ -115,10 +115,12 @@ export async function resolveClaudeExecutable(
   return undefined;
 }
 
-function withConfigDirectory(env: Record<string, string | undefined>): Record<string, string> {
+function baseProcessEnvironment(env: Record<string, string | undefined>): Record<string, string> {
   const output: Record<string, string> = {};
   for (const [key, value] of Object.entries(env)) if (value !== undefined) output[key] = value;
   if (output.PI_CLAUDE_CODE_CONFIG_DIR) output.CLAUDE_CONFIG_DIR = output.PI_CLAUDE_CODE_CONFIG_DIR;
+  // Identify Pi rather than inheriting the identity of its host application.
+  output.CLAUDE_CODE_ENTRYPOINT = output.PI_CLAUDE_CODE_ENTRYPOINT || "pi-claude-code";
   return output;
 }
 
@@ -155,7 +157,7 @@ export async function getClaudeStatus(
   envInput: Record<string, string | undefined> = process.env,
   signal?: AbortSignal,
 ): Promise<ClaudeStatus> {
-  const env = withConfigDirectory(envInput);
+  const env = baseProcessEnvironment(envInput);
   const command = await resolveClaudeExecutable(env);
   if (!command) return { available: false, loggedIn: false, subscription: false, detail: INSTALL_HINT };
   try {
@@ -192,7 +194,7 @@ async function readyClaudeCommand(
   envInput: Record<string, string | undefined>,
   signal?: AbortSignal,
 ): Promise<string> {
-  const env = withConfigDirectory(envInput);
+  const env = baseProcessEnvironment(envInput);
   const key = JSON.stringify([configuredCommand(env), env.PATH, env.HOME, env.CLAUDE_CONFIG_DIR]);
   const cached = readyStatusCache.get(key);
   if (cached && cached.expires > Date.now()) return cached.command;
@@ -424,7 +426,7 @@ function processEnvironment(
   input: Record<string, string | undefined> | undefined,
   extraBody: Record<string, unknown>,
 ): Record<string, string> {
-  const env = withConfigDirectory({ ...process.env, ...input });
+  const env = baseProcessEnvironment({ ...process.env, ...input });
   const conflicts = conflictingEnvironment(env);
   if (conflicts.length) {
     throw new Error(`Claude Code subscription provider refuses conflicting auth/backend overrides: ${conflicts.join(", ")}`);
