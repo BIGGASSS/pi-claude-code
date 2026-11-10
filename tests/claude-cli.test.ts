@@ -432,6 +432,38 @@ test("strips reminder blocks from text-array tool results and keeps Claude Code'
   ]);
 });
 
+test("keeps Pi's own image scale note exactly once in a tool result", () => {
+  const image = { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "resized" } };
+  const note = text("[Image: original 2400x1784, displayed at 2000x1487. Multiply coordinates by 1.20 to map to original image.]");
+  const result = [text("Script completed\nOutput:\n"), text("[Image saved to /tmp/shot.jpg (image/jpeg, 57.1KB)]"), image, note, text("<console_output>done</console_output>")];
+  const canonical = [
+    { role: "user", content: [text("inspect")] },
+    { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "read", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: result }] },
+  ];
+  const withReminder = structuredClone(canonical);
+  ((withReminder[2]!.content as Block[])[0]!.content as Block[]).push(text(`\n${account}`));
+  for (const wire of [structuredClone(canonical), withReminder]) {
+    const rewritten = rewrite(wire, framesFor(canonical));
+    assert.deepEqual(withoutMarkers(rewritten), canonical);
+    const content = (rewritten[2]?.content as Block[])[0]?.content as Block[];
+    assert.equal(content.filter((block) => block.text === note.text).length, 1);
+  }
+});
+
+test("keeps a tool result whose canonical content already has the image scale note", () => {
+  const image = { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "shot" } };
+  const note = text("[Image: original 728x2490, displayed at 585x2000. Multiply coordinates by 1.24 to map to original image.]");
+  const result = { type: "tool_result", tool_use_id: "t1", content: [text("{}"), image, note] };
+  const canonical = [
+    { role: "user", content: [text("preview")] },
+    { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "html_preview", input: {} }] },
+    { role: "user", content: [result] },
+  ];
+  const rewritten = rewrite(structuredClone(canonical), framesFor(canonical));
+  assert.deepEqual(rewritten[2]?.content, [result]);
+});
+
 test("keeps user-authored reminder-like text and ordinary output unchanged", () => {
   const canonical = [
     { role: "user", content: [text("<system-reminder>mine</system-reminder>"), text("inspect")] },
