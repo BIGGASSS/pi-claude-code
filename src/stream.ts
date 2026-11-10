@@ -33,7 +33,8 @@ import {
   prepareNativeTranscript,
   coerceStringifiedArguments,
   prepareTools,
-  TOOL_PREFIX,
+  canonicalizeToolUseNames,
+  resolveToolName,
 } from "./transcript.ts";
 
 interface IndexedText {
@@ -127,16 +128,9 @@ function comparableContent(content: AssistantMessage["content"]): unknown[] {
   });
 }
 
-// Claude can name a tool that Pi never declared. Pi's agent loop answers that
-// with a "not found" tool result the model can recover from, so the name passes
-// through rather than failing the turn.
-function piToolName(nativeName: string): string {
-  return nativeName.startsWith(TOOL_PREFIX) ? nativeName.slice(TOOL_PREFIX.length) : nativeName;
-}
-
 type ToolSchemas = ReadonlyMap<string, Record<string, unknown>>;
 
-function nativeContent(content: NativeContentBlock[], schemas: ToolSchemas = new Map()): AssistantMessage["content"] {
+function nativeContent(content: NativeContentBlock[], schemas: ToolSchemas): AssistantMessage["content"] {
   const converted: AssistantMessage["content"] = [];
   for (const block of content) {
     if (block.type === "text") {
@@ -155,7 +149,8 @@ function nativeContent(content: NativeContentBlock[], schemas: ToolSchemas = new
         redacted: true,
       });
     } else if (block.type === "tool_use") {
-      converted.push({ type: "toolCall", id: block.id, name: piToolName(block.name), arguments: coerceStringifiedArguments(block.input, schemas.get(piToolName(block.name))) as never });
+      const name = resolveToolName(block.name, schemas).name;
+      converted.push({ type: "toolCall", id: block.id, name, arguments: coerceStringifiedArguments(block.input, schemas.get(name)) as never });
     }
   }
   return converted;
@@ -206,6 +201,7 @@ class EventTranslator {
     usage: NativeUsage,
     initialSystemMessages?: unknown[],
   ): void {
+    canonicalizeToolUseNames(message, this.schemas);
     const authoritative = nativeContent(message.content, this.schemas);
     if (!this.sawContentEvent) {
       this.emitComplete(authoritative);
@@ -253,7 +249,7 @@ class EventTranslator {
       this.output.content.push({
         type: "toolCall",
         id: native.id,
-        name: piToolName(native.name),
+        name: resolveToolName(native.name, this.schemas).name,
         arguments: (native.input ?? {}) as ToolCall["arguments"],
         nativeIndex,
         partialJson: "",
