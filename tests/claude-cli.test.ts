@@ -96,6 +96,72 @@ test("stabilizes Claude Code's native replay reminders and cache breakpoint", ()
   assert.deepEqual((rewritten.at(-1)?.content as Block[]).at(-1)?.cache_control, { type: "ephemeral", ttl: "1h" });
 });
 
+for (const prompt of ["/tmp/pi-clipboard-test.png", "/tmp/pi-clipboard-test.png should we do anything with this?"]) {
+  test(`rewrites a string initial user message after a tool round: ${prompt} (issue #31)`, () => {
+    const canonical = [
+      { role: "user", content: [text(prompt)] },
+      { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "read", input: { path: "/tmp/pi-clipboard-test.png" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "image result" }] },
+    ];
+    const wire: WireMessage[] = structuredClone(canonical);
+    wire[0]!.content = prompt;
+    assert.deepEqual(rewrite(wire, framesFor(canonical)), canonical);
+  });
+}
+
+test("preserves canonical content, reminders, and replay cache with a string initial user (issue #31)", () => {
+  const marker = { type: "ephemeral", ttl: "1h" };
+  const prompt = "/tmp/pi-clipboard-test.png <system-reminder>mine</system-reminder>";
+  const canonical = [
+    { role: "user", content: [text(prompt)] },
+    { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "read", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: `file says\n${account}` }] },
+    { role: "assistant", content: [{ type: "tool_use", id: "t2", name: "read", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t2", content: "current result" }] },
+  ];
+  const initialSystemMessages = [
+    { role: "system", content: [{ ...text("environment reminder\ndate reminder"), cache_control: marker }] },
+  ];
+  const wire: WireMessage[] = structuredClone(canonical);
+  wire[0]!.content = `${prompt}\n${memory}`;
+  wire[2]!.content = [
+    { type: "tool_result", tool_use_id: "t1", content: `file says\n${account}\n${memory}` },
+    { ...text(account), cache_control: marker },
+  ];
+  wire[4]!.content = [
+    { type: "tool_result", tool_use_id: "t2", content: `current result\n${memory}${account}` },
+  ];
+  wire.splice(1, 0, { role: "system", content: [text("changed environment reminder")] });
+  wire.push({ role: "system", content: [{ ...text("date reminder"), cache_control: marker }] });
+
+  const rewritten = rewrite(wire, framesFor(canonical), initialSystemMessages);
+  assert.deepEqual(withoutMarkers(rewritten), [
+    canonical[0],
+    { role: "system", content: [text("environment reminder\ndate reminder")] },
+    ...canonical.slice(1),
+  ]);
+  assert.equal((rewritten[0]?.content as Block[])[0]?.cache_control, undefined);
+  assert.equal((rewritten[1]?.content as Block[])[0]?.cache_control, undefined);
+  assert.deepEqual((rewritten[3]?.content as Block[])[0]?.cache_control, marker);
+  assert.deepEqual((rewritten[5]?.content as Block[])[0]?.cache_control, marker);
+});
+
+test("rejects missing or malformed initial user messages", () => {
+  const frames = framesFor([{ role: "user", content: [text("inspect")] }]);
+  const invalid: WireMessage[][] = [
+    [],
+    [{ role: "assistant", content: "inspect" }],
+    [{ role: "system", content: [text("inspect")] }],
+    ...[undefined, null, false, true, 0, 42, {}, text("inspect")].map((content) => [{ role: "user", content }]),
+  ];
+  for (const wire of invalid) {
+    assert.throws(() => rewrite(wire, frames), /Claude Code request is missing its initial user message/);
+  }
+  for (const content of [[], [null], ["inspect"]]) {
+    assert.throws(() => rewrite([{ role: "user", content }], frames), /lost a text block in user message 0/);
+  }
+});
+
 test("strips reminders when the first user message carries none (issue #27)", () => {
   const canonical = [
     { role: "user", content: [text("inspect")] },
