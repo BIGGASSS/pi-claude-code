@@ -60,7 +60,7 @@ function nativeToolUseId(id: string): string {
 
 export function prepareMessages(messages: Message[], model: Model<any>): Message[] {
   const toolCallIds = new Map<string, string>();
-  return messages.map((message) => {
+  const normalized = messages.map((message): Message => {
     if (message.role === "toolResult") {
       const id = toolCallIds.get(message.toolCallId);
       return id && id !== message.toolCallId ? { ...message, toolCallId: id } : message;
@@ -86,6 +86,57 @@ export function prepareMessages(messages: Message[], model: Model<any>): Message
       }),
     };
   });
+  return answerOrphanedToolCalls(normalized);
+}
+
+// Mirror pi-ai's transformMessages second pass locally: extension loaders don't expose pi-ai/api/*.
+function answerOrphanedToolCalls(messages: Message[]): Message[] {
+  const result: Message[] = [];
+  let pendingAssistant: AssistantMessage | undefined;
+  const existingToolResultIds = new Set<string>();
+  const heldSystemMessages: SystemMessage[] = [];
+  const closePendingToolCalls = () => {
+    if (pendingAssistant) {
+      for (const block of pendingAssistant.content) {
+        if (block.type !== "toolCall" || existingToolResultIds.has(block.id)) continue;
+        result.push({
+          role: "toolResult",
+          toolCallId: block.id,
+          toolName: block.name,
+          content: [{ type: "text", text: "No result provided" }],
+          isError: true,
+          // Unlike Date.now(), the originating turn's time is stable across replays.
+          timestamp: pendingAssistant.timestamp,
+        });
+      }
+      pendingAssistant = undefined;
+    }
+    existingToolResultIds.clear();
+    result.push(...heldSystemMessages);
+    heldSystemMessages.length = 0;
+  };
+
+  for (const message of messages) {
+    if (message.role === "assistant") {
+      closePendingToolCalls();
+      // Incomplete turns can contain partial tool calls and invalid signed reasoning.
+      if (message.stopReason === "error" || message.stopReason === "aborted") continue;
+      if (message.content.some((block) => block.type === "toolCall")) pendingAssistant = message;
+      result.push(message);
+    } else if (message.role === "toolResult") {
+      existingToolResultIds.add(message.toolCallId);
+      result.push(message);
+    } else if (message.role === "system") {
+      // System updates must not split a tool call from its real or synthetic results.
+      if (pendingAssistant) heldSystemMessages.push(message);
+      else result.push(message);
+    } else {
+      closePendingToolCalls();
+      result.push(message);
+    }
+  }
+  closePendingToolCalls();
+  return result;
 }
 
 function clone<T>(value: T): T {
