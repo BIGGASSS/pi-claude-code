@@ -859,7 +859,7 @@ export function rewriteInitialRequest(
   };
   let messages = payload.messages;
   const first = messages?.[0];
-  if (first?.role !== "user" || !Array.isArray(first.content)) {
+  if (first?.role !== "user" || (!Array.isArray(first.content) && typeof first.content !== "string")) {
     throw new Error("Claude Code request is missing its initial user message");
   }
   if (messages) restoreCanonicalUserContent(messages, frames);
