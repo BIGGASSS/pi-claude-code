@@ -74,9 +74,10 @@ tool execution. In particular, it:
   account email, attachments). The relay matches Pi's blocks to Claude Code's
   in order and drops the rest. It keeps Claude Code's copies of images, because
   it may have downscaled them and added a note on how to map coordinates back
-  to the original. Workers also disable auto-memory and CLAUDE.md loading, so
-  those reminders are not created in the first place. If a request no longer
-  lines up with Pi's history, the turn fails rather than sending a guess;
+  to the original. Workers also disable auto-memory, CLAUDE.md loading, and
+  the silent-turn reminder, so those reminders are not created in the first
+  place. If a request no longer lines up with Pi's history, the turn fails
+  rather than sending a guess;
 - relies on replayed assistant frames carrying the model that answered
   (`responseModel`, recorded from `message_start`, else Pi's stored
   `message.model`). Claude Code drops signed thinking from replayed turns it
