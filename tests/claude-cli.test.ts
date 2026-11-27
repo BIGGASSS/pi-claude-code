@@ -1389,6 +1389,20 @@ test("reports upstream 5xx as retryable and keeps 4xx non-retryable", async () =
   assert.equal(invalid.retryable, false);
 });
 
+test("keeps a message breakpoint when the dropped date reminder held Claude Code's only marker", () => {
+  const environment = { role: "system", content: [text("environment\nToday's date is 2026-11-25.")] };
+  const ask = { role: "user", content: [text("ask")] };
+  const date = { role: "system", content: [{ ...text("Today's date is 2026-11-25."), cache_control: { type: "ephemeral" } }] };
+  const reply = { role: "assistant", content: [text("reply")] };
+  const next = { role: "user", content: [text("next")] };
+  const rewritten = rewrite([ask, environment, reply, next, date], framesFor([ask, reply, next]));
+
+  assert.equal(rewritten.length, 4);
+  assert.equal(count(rewritten), 1);
+  // Same TTL as Claude Code's marker, so it cannot follow an earlier 5m one with 1h.
+  assert.deepEqual((rewritten[3]?.content as Block[]).at(-1)?.cache_control, { type: "ephemeral" });
+});
+
 test("drops Claude Code's date reminder from the middle without captured system messages", () => {
   const date = (day: string) => ({ role: "system", content: `Today's date is 2026-11-${day}.` });
   const history = [

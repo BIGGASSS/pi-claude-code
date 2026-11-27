@@ -1076,8 +1076,18 @@ export function rewriteInitialRequest(
     messages.splice(1, systemEnd - 1, ...restored);
   }
   if (messages) {
+    let marker: unknown;
+    JSON.stringify(messages, (key, child) => (key === "cache_control" ? ((marker = child), undefined) : child));
     messages = withDateReminderAtEnd(withoutRepeatedSystemMessages(messages));
     payload.messages = messages;
+    // Claude Code may have put its only message marker on a dropped date reminder;
+    // move it, TTL unchanged, to the newest non-system message.
+    const last = messages.findLast((message) => message.role !== "system");
+    if (marker && !countCacheControl(messages) && last) {
+      if (typeof last.content === "string") last.content = [{ type: "text", text: last.content }];
+      const block = Array.isArray(last.content) ? last.content.at(-1) : undefined;
+      if (isBlock(block)) block.cache_control = marker;
+    }
   }
 
   if (nativeSystemInjections) {
