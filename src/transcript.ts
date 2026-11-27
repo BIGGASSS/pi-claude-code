@@ -239,7 +239,30 @@ function canonicalAssistantContent(message: AssistantMessage): NativeContentBloc
   return blocks;
 }
 
+/** Claude Code's placeholder text for a turn that ended with no text or thinking. */
+const NO_CONTENT_PLACEHOLDER = "(no content)";
+
+/**
+ * Claude Code drops an assistant turn whose only block is empty or its
+ * placeholder text, and merges the user messages around it. Skip such a turn
+ * so the frames merge the same way.
+ */
+function isDroppedAssistantContent(blocks: NativeContentBlock[]): boolean {
+  if (blocks.length !== 1) return blocks.length === 0;
+  const block = blocks[0] as { type?: string; text?: unknown };
+  return (
+    block.type === "text" &&
+    typeof block.text === "string" &&
+    (block.text.trim() === "" || block.text === NO_CONTENT_PLACEHOLDER)
+  );
+}
+
 function assistantContent(message: AssistantMessage): NativeContentBlock[] {
+  const blocks = replayableAssistantContent(message);
+  return isDroppedAssistantContent(blocks) ? [] : blocks;
+}
+
+function replayableAssistantContent(message: AssistantMessage): NativeContentBlock[] {
   const carrier = replayCarrier(message);
   if (carrier && projectionsEqual(assistantProjection(message), carrier.projection)) {
     return clone(carrier.message.content);

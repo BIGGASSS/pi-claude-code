@@ -103,6 +103,44 @@ test("sends error tool results as text only because Claude Code drops their imag
   assert.equal((succeeded!.content as unknown[]).length, 3);
 });
 
+test("skips assistant turns Claude Code drops and merges the user messages around them", () => {
+  const reply = (text: string, timestamp: number): AssistantMessage => ({
+    role: "assistant",
+    api: "claude-code-stream-json",
+    provider: "claude-code",
+    model: "claude-sonnet-5-5",
+    content: [{ type: "text", text }],
+    usage,
+    stopReason: "stop",
+    timestamp,
+  });
+  const call: AssistantMessage = {
+    ...reply("", 3),
+    content: [{ type: "toolCall", id: "t1", name: "wait", arguments: {} }],
+    stopReason: "toolUse",
+  };
+  const frames = prepareFrames([
+    { role: "user", content: "say nothing", timestamp: 1 },
+    reply("(no content)", 2),
+    { role: "user", content: "wait for the others", timestamp: 2 },
+    call,
+    { role: "toolResult", toolCallId: "t1", toolName: "wait", content: [{ type: "text", text: "done" }], isError: false, timestamp: 4 },
+    reply("(no content)", 5),
+    { role: "user", content: "now say hi", timestamp: 6 },
+    reply("  ", 7),
+    { role: "user", content: "again", timestamp: 8 },
+  ]);
+  assert.deepEqual(
+    frames.map((frame) => frame.type),
+    ["user", "assistant", "user"],
+  );
+  assert.equal(frames[0]!.message.content.length, 2);
+  assert.deepEqual(
+    (frames[2]!.message.content as Array<{ type: string }>).map((block) => block.type),
+    ["tool_result", "text", "text"],
+  );
+});
+
 test("replays native signed blocks only while the visible projection is unchanged", () => {
   const assistant: AssistantMessage = {
     role: "assistant",

@@ -554,6 +554,27 @@ test("lines up a failed tool result that had images with Claude Code's text-only
   assert.equal(failed.content, "Script failed\n[Image saved to /tmp/shot.png]\nScript error: ENOENT");
 });
 
+test("lines up a history with a (no content) assistant turn that Claude Code drops", () => {
+  // The session from issue #30, followed by the next prompt.
+  const frames = prepareFrames([
+    { role: "user", content: "say nothing", timestamp: 1793959201000 },
+    {
+      role: "assistant",
+      api: "claude-code-stream-json",
+      provider: "claude-code",
+      model: "claude-sonnet-5-5",
+      content: [{ type: "text", text: "(no content)" }],
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      stopReason: "stop",
+      timestamp: 1793959202000,
+    },
+    { role: "user", content: "now say hi", timestamp: 1793959203000 },
+  ]);
+  // Claude Code removes the placeholder turn and merges the user messages around it.
+  const wire = [{ role: "user", content: [text(account), text("say nothing"), text("now say hi")] }];
+  assert.deepEqual(withoutMarkers(rewrite(wire, frames)), [{ role: "user", content: frames[0]!.message.content }]);
+});
+
 test("injects native system history at assistant boundaries", () => {
   const body = {
     system: [
