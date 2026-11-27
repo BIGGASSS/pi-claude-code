@@ -141,6 +141,37 @@ test("skips assistant turns Claude Code drops and merges the user messages aroun
   );
 });
 
+test("keeps consecutive user texts apart when they share one native message", () => {
+  const frames = prepareFrames([
+    { role: "user", content: "list /tmp/foo", timestamp: 0 },
+    { role: "user", content: [{ type: "text", text: "status: 3 notes" }], timestamp: 1 },
+  ]);
+  assert.equal(frames.length, 1);
+  const texts = frames[0]!.message.content.map((block) => (block as { text: string }).text);
+  assert.deepEqual(texts, ["list /tmp/foo", "\n\nstatus: 3 notes"]);
+});
+
+test("keeps user texts apart when a dropped assistant turn merges them", () => {
+  const frames = prepareFrames([
+    { role: "user", content: "say nothing", timestamp: 1 },
+    {
+      role: "assistant",
+      api: "claude-code-stream-json",
+      provider: "claude-code",
+      model: "claude-sonnet-5-5",
+      content: [{ type: "text", text: "(no content)" }],
+      usage,
+      stopReason: "stop",
+      timestamp: 2,
+    },
+    { role: "user", content: "now say hi", timestamp: 3 },
+  ]);
+  assert.deepEqual(frames[0]!.message.content, [
+    { type: "text", text: "say nothing" },
+    { type: "text", text: "\n\nnow say hi" },
+  ]);
+});
+
 test("replays native signed blocks only while the visible projection is unchanged", () => {
   const assistant: AssistantMessage = {
     role: "assistant",

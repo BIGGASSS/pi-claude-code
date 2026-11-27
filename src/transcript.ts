@@ -314,6 +314,13 @@ export function prepareFrames(messages: Message[]): NativeFrame[] {
     if (blocks.length === 0) continue;
     const previous = frames.at(-1);
     if (role === "user" && previous?.type === "user") {
+      // Keep adjacent texts of merged messages apart so the model doesn't read
+      // them as one word. A separate blank block would be dropped by Claude Code.
+      const last = previous.message.content.at(-1) as { type?: string } | undefined;
+      const first = blocks[0] as { type?: string; text?: unknown };
+      if (last?.type === "text" && first.type === "text" && typeof first.text === "string" && !/^\s/u.test(first.text)) {
+        blocks[0] = { ...first, text: `\n\n${first.text}` };
+      }
       previous.message.content.push(...blocks);
     } else {
       frames.push({ type: role, message: { role, content: blocks, ...(model && { model }) } });
