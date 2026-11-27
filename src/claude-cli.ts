@@ -767,7 +767,7 @@ function setReplayCacheBreakpoints(messages: NativeRequestMessage[]): void {
   // Every other marker goes, e.g. Claude Code's on the last user message once
   // a trailing system message follows it.
   messages.forEach((message, index) => {
-    if (!kept.has(index)) message.content = withoutCacheControl(message.content);
+    if (!kept.has(index)) message.content = withoutMessageMarkers(message.content);
   });
   if (boundary !== undefined) setCacheBreakpoint(messages[boundary]!);
 
@@ -776,7 +776,7 @@ function setReplayCacheBreakpoints(messages: NativeRequestMessage[]): void {
   // cache a prefix that the next turn cannot read.
   const finalIndex = messages.findLastIndex((message) => message.role !== "system");
   for (const message of messages.slice(finalIndex + 1)) {
-    message.content = withoutCacheControl(message.content);
+    message.content = withoutMessageMarkers(message.content);
   }
 
   if (finalIndex >= 0) {
@@ -786,13 +786,34 @@ function setReplayCacheBreakpoints(messages: NativeRequestMessage[]): void {
 
 const MAX_CACHE_BREAKPOINTS = 4;
 
-function countCacheControl(value: unknown): number {
-  if (Array.isArray(value)) return value.reduce((sum: number, child) => sum + countCacheControl(child), 0);
-  if (!value || typeof value !== "object") return 0;
-  return Object.entries(value).reduce(
-    (sum: number, [key, child]) => sum + (key === "cache_control" ? 1 : countCacheControl(child)),
-    0,
+/**
+ * The blocks that can carry a breakpoint: message content blocks and the
+ * blocks inside tool results. Tool inputs are the model's arguments, where
+ * `cache_control` is data and stays untouched.
+ */
+function markerBlocks(content: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(content)) return [];
+  return content.flatMap((block) =>
+    isBlock(block) ? [block, ...(block.type === "tool_result" ? markerBlocks(block.content) : [])] : [],
   );
+}
+
+function countMarkers(blocks: unknown): number {
+  return Array.isArray(blocks) ? blocks.filter((block) => isBlock(block) && "cache_control" in block).length : 0;
+}
+
+function countMessageMarkers(messages: NativeRequestMessage[]): number {
+  return messages.reduce((sum, message) => sum + countMarkers(markerBlocks(message.content)), 0);
+}
+
+function withoutMessageMarkers(content: unknown): unknown {
+  if (!Array.isArray(content)) return content;
+  return content.map((block) => {
+    if (!isBlock(block)) return block;
+    const { cache_control: _marker, ...rest } = block;
+    if (rest.type === "tool_result") rest.content = withoutMessageMarkers(rest.content);
+    return rest;
+  });
 }
 
 /**
@@ -802,12 +823,12 @@ function countCacheControl(value: unknown): number {
  */
 function capCacheBreakpoints(payload: { tools?: unknown; system?: unknown; messages?: NativeRequestMessage[] }): void {
   const messages = payload.messages ?? [];
-  let total = countCacheControl([payload.tools, payload.system, messages]);
-  const newest = messages.findLastIndex((message) => countCacheControl(message) > 0);
+  let total = countMarkers(payload.tools) + countMarkers(payload.system) + countMessageMarkers(messages);
+  const newest = messages.findLastIndex((message) => countMessageMarkers([message]) > 0);
   for (let index = 0; index < newest && total > MAX_CACHE_BREAKPOINTS; index++) {
-    const markers = countCacheControl(messages[index]);
+    const markers = countMessageMarkers([messages[index]!]);
     if (!markers) continue;
-    messages[index] = withoutCacheControl(messages[index]) as NativeRequestMessage;
+    messages[index] = { ...messages[index], content: withoutMessageMarkers(messages[index]!.content) };
     total -= markers;
   }
 }
@@ -1076,14 +1097,14 @@ export function rewriteInitialRequest(
     messages.splice(1, systemEnd - 1, ...restored);
   }
   if (messages) {
-    let marker: unknown;
-    JSON.stringify(messages, (key, child) => (key === "cache_control" ? ((marker = child), undefined) : child));
+    const marker = messages.flatMap((message) => markerBlocks(message.content)).findLast((block) => block.cache_control)
+      ?.cache_control;
     messages = withDateReminderAtEnd(withoutRepeatedSystemMessages(messages));
     payload.messages = messages;
     // Claude Code may have put its only message marker on a dropped date reminder;
     // move it, TTL unchanged, to the newest non-system message.
     const last = messages.findLast((message) => message.role !== "system");
-    if (marker && !countCacheControl(messages) && last) {
+    if (marker && !countMessageMarkers(messages) && last) {
       if (typeof last.content === "string") last.content = [{ type: "text", text: last.content }];
       const block = Array.isArray(last.content) ? last.content.at(-1) : undefined;
       if (isBlock(block)) block.cache_control = marker;

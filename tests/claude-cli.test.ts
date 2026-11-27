@@ -1389,6 +1389,24 @@ test("reports upstream 5xx as retryable and keeps 4xx non-retryable", async () =
   assert.equal(invalid.retryable, false);
 });
 
+test("keeps a cache_control tool argument while moving replay breakpoints", () => {
+  const call = { type: "tool_use", id: "t1", name: "mcp__pi__request", input: { cache_control: { type: "ephemeral" } } };
+  const canonical = [
+    { role: "user", content: [text("first")] },
+    { role: "assistant", content: [call] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "done" }] },
+    { role: "assistant", content: [text("ok")] },
+    { role: "user", content: [text("next")] },
+  ];
+  const wire = [canonical[0]!, { role: "system", content: [text("environment")] }, ...canonical.slice(1)];
+  const body = Buffer.from(JSON.stringify({ tools: [{ name: "mcp__pi__request", cache_control: { type: "ephemeral" } }], system: [text("s")], messages: wire }));
+  const rewritten = JSON.parse(
+    rewriteInitialRequest(body, framesFor(canonical), [{ role: "system", content: [text("environment")] }], []).toString("utf8"),
+  ) as { messages: WireMessage[] };
+
+  assert.deepEqual(rewritten.messages[2]?.content, [call]);
+});
+
 test("keeps a message breakpoint when the dropped date reminder held Claude Code's only marker", () => {
   const environment = { role: "system", content: [text("environment\nToday's date is 2026-11-25.")] };
   const ask = { role: "user", content: [text("ask")] };
