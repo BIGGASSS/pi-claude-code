@@ -3,6 +3,7 @@ import * as http from "node:http";
 import { chmod, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Writable } from "node:stream";
 import test from "node:test";
 import { isRetryableAssistantError, type AssistantMessage } from "@earendil-works/pi-ai";
 import {
@@ -12,6 +13,7 @@ import {
   getClaudeStatus,
   rewriteInitialRequest,
   runClaudeRequest,
+  writeFrame,
 } from "../src/claude-cli.ts";
 import type { NativeFrame } from "../src/native-types.ts";
 import { createClaudeCodeProvider } from "../src/provider.ts";
@@ -1430,4 +1432,14 @@ test("reports a transient upstream stream error as retryable and keeps others no
   const invalid = await streamError("invalid_request_error", "bad request");
   assert.match(invalid.message, /Incomplete Claude Code upstream response \(status 200.*upstream said: invalid_request_error: bad request/);
   assert.equal(invalid.retryable, false);
+});
+
+test("backpressured frame writes leave no listeners on stdin", async () => {
+  // A tiny buffer makes every write wait for "drain".
+  const stdin = new Writable({ highWaterMark: 1, write: (_chunk, _encoding, done) => setImmediate(done) });
+  const child = { stdin } as unknown as Parameters<typeof writeFrame>[0];
+  const before = { drain: stdin.listenerCount("drain"), error: stdin.listenerCount("error") };
+  const frame: NativeFrame = { type: "user", message: { role: "user", content: [{ type: "text", text: "x" }] } };
+  for (let i = 0; i < 12; i++) await writeFrame(child, frame);
+  assert.deepEqual({ drain: stdin.listenerCount("drain"), error: stdin.listenerCount("error") }, before);
 });

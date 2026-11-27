@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { delimiter, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
+import { once } from "node:events";
 import { spawn, type ChildProcess } from "node:child_process";
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { TurnRelay } from "./turn-relay.ts";
@@ -642,14 +643,12 @@ function processEnvironment(
 }
 
 /** Writes a frame stamped with a fresh uuid, which Claude Code echoes back on that frame's result. */
-async function writeFrame(child: ChildProcess, frame: NativeFrame): Promise<string> {
+export async function writeFrame(child: ChildProcess, frame: NativeFrame): Promise<string> {
   if (!child.stdin?.writable) throw new Error("Claude Code stdin closed during history replay");
   const uuid = randomUUID();
   if (!child.stdin.write(`${JSON.stringify({ ...frame, uuid })}\n`)) {
-    await new Promise<void>((resolve, reject) => {
-      child.stdin!.once("drain", resolve);
-      child.stdin!.once("error", reject);
-    });
+    // `once` rejects on "error" and removes both listeners whichever event wins.
+    await once(child.stdin, "drain");
   }
   return uuid;
 }
