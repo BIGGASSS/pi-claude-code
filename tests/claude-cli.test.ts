@@ -539,6 +539,49 @@ test("never emits more than four breakpoints across replay shapes", () => {
   assert.equal(checked, 576, "every constructible shape is checked");
 });
 
+test("keeps four breakpoints on warm and cold continuations (issue #40 repro)", () => {
+  // Request shape captured from Claude Code 2.1.330, content replaced. Claude
+  // Code marks only its last message: the newest user on a warm worker, a
+  // trailing date reminder on a cold one.
+  const marker = { type: "ephemeral", ttl: "1h" };
+  const marked = (value: string): Block => ({ ...text(value), cache_control: marker });
+  const tools = [
+    { name: "mcp__pi__read", input_schema: { type: "object" }, cache_control: marker },
+    { name: "__pi_deferred_placeholder__", input_schema: { type: "object" }, defer_loading: true },
+  ];
+  const system = [text("billing header"), marked("identity"), marked("system prompt")];
+  const initialSystemMessages = [{ role: "system", content: [marked("environment reminder\ntoday's date")] }];
+  const frames = (users: number): NativeFrame[] => {
+    const out: NativeFrame[] = [];
+    for (let i = 1; i <= users; i++) {
+      out.push({ type: "user", message: { role: "user", content: [text(`question ${i}`)] } });
+      if (i < users) out.push({ type: "assistant", message: { role: "assistant", content: [text(`answer ${i}`)] } });
+    }
+    return out;
+  };
+  const update = [{ beforeAssistant: null, content: [text('Updated system prompt section "mcp_servers": ...')] }];
+
+  for (const users of [2, 4]) {
+    for (const warm of [true, false]) {
+      for (const withUpdate of [false, true]) {
+        const shape = `${users} users, ${warm ? "warm" : "cold"}, ${withUpdate ? "with" : "without"} trailing update`;
+        const messages: WireMessage[] = [];
+        frames(users).forEach((frame, index) => {
+          messages.push(structuredClone(frame.message) as WireMessage);
+          if (index === 0) messages.push({ role: "system", content: "environment reminder" });
+        });
+        if (warm) messages.at(-1)!.content = [marked(`question ${users}`)];
+        else messages.push({ role: "system", content: [marked("today's date")] });
+        const body = { tools: structuredClone(tools), system: structuredClone(system), messages };
+        assert.equal(count(body), 4, shape);
+
+        const rewritten = rewritePayload(body, frames(users), initialSystemMessages, withUpdate ? update : []);
+        assert.ok(count(rewritten) <= 4, `${shape}: found ${count(rewritten)} cache_control markers`);
+      }
+    }
+  }
+});
+
 const userFrame = (text: string) => ({
   type: "user" as const,
   message: { role: "user" as const, content: [{ type: "text", text }] },
