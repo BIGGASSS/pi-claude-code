@@ -1,7 +1,11 @@
+import { stat } from "node:fs/promises";
+import { isAbsolute } from "node:path";
 import {
+  appendAssistantMessageDiagnostic,
   calculateCost,
   collapseSystemMessages,
   createAssistantMessageEventStream,
+  getCurrentSystemMessage,
   getCurrentSystemPrompt,
   getCurrentTools,
   getInitialSystemMessage,
@@ -27,8 +31,10 @@ import {
   prepareFrames,
   prepareMessages,
   prepareNativeTranscript,
+  coerceStringifiedArguments,
   prepareTools,
-  TOOL_PREFIX,
+  canonicalizeToolUseNames,
+  resolveToolName,
 } from "./transcript.ts";
 
 interface IndexedText {
@@ -122,14 +128,9 @@ function comparableContent(content: AssistantMessage["content"]): unknown[] {
   });
 }
 
-// Claude can name a tool that Pi never declared. Pi's agent loop answers that
-// with a "not found" tool result the model can recover from, so the name passes
-// through rather than failing the turn.
-function piToolName(nativeName: string): string {
-  return nativeName.startsWith(TOOL_PREFIX) ? nativeName.slice(TOOL_PREFIX.length) : nativeName;
-}
+type ToolSchemas = ReadonlyMap<string, Record<string, unknown>>;
 
-function nativeContent(content: NativeContentBlock[]): AssistantMessage["content"] {
+function nativeContent(content: NativeContentBlock[], schemas: ToolSchemas): AssistantMessage["content"] {
   const converted: AssistantMessage["content"] = [];
   for (const block of content) {
     if (block.type === "text") {
@@ -148,7 +149,8 @@ function nativeContent(content: NativeContentBlock[]): AssistantMessage["content
         redacted: true,
       });
     } else if (block.type === "tool_use") {
-      converted.push({ type: "toolCall", id: block.id, name: piToolName(block.name), arguments: block.input as never });
+      const name = resolveToolName(block.name, schemas).name;
+      converted.push({ type: "toolCall", id: block.id, name, arguments: coerceStringifiedArguments(block.input, schemas.get(name)) as never });
     }
   }
   return converted;
@@ -162,6 +164,7 @@ class EventTranslator {
     private readonly model: Model<any>,
     private readonly output: AssistantMessage,
     private readonly stream: AssistantMessageEventStream,
+    private readonly schemas: ToolSchemas = new Map(),
   ) {}
 
   event(event: AnthropicStreamEvent): void {
@@ -198,7 +201,8 @@ class EventTranslator {
     usage: NativeUsage,
     initialSystemMessages?: unknown[],
   ): void {
-    const authoritative = nativeContent(message.content);
+    canonicalizeToolUseNames(message, this.schemas);
+    const authoritative = nativeContent(message.content, this.schemas);
     if (!this.sawContentEvent) {
       this.emitComplete(authoritative);
     } else if (JSON.stringify(comparableContent(this.output.content)) !== JSON.stringify(comparableContent(authoritative))) {
@@ -245,7 +249,7 @@ class EventTranslator {
       this.output.content.push({
         type: "toolCall",
         id: native.id,
-        name: piToolName(native.name),
+        name: resolveToolName(native.name, this.schemas).name,
         arguments: (native.input ?? {}) as ToolCall["arguments"],
         nativeIndex,
         partialJson: "",
@@ -286,7 +290,10 @@ class EventTranslator {
     } else if (block.type === "thinking") {
       this.stream.push({ type: "thinking_end", contentIndex, content: block.thinking, partial: this.output });
     } else {
-      block.arguments = parseArguments(block.partialJson, block.arguments);
+      block.arguments = coerceStringifiedArguments(
+        parseArguments(block.partialJson, block.arguments),
+        this.schemas.get(block.name),
+      );
       delete (block as Partial<IndexedToolCall>).partialJson;
       this.stream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial: this.output });
     }
@@ -328,6 +335,37 @@ export function normalizeError(error: unknown): string {
   return message;
 }
 
+const CWD_SECTION = /^<cwd>\n([^\n]+)\n<\/cwd>$/u;
+
+interface SessionCwd {
+  cwd: string;
+  /** Set when the session named a cwd that could not be used. */
+  rejected?: { cwd: string; reason: "not-absolute" | "not-a-directory" };
+}
+
+/**
+ * Pi passes no cwd to providers, but its structured system prompt carries the
+ * session cwd as the `cwd` section. Read that section by name, not by searching
+ * the rendered prompt, so project instructions or extension sections that
+ * contain `<cwd>` text cannot redirect Claude Code.
+ */
+async function resolveSessionCwd(messages: TranscriptContext["messages"]): Promise<SessionCwd> {
+  const section = getCurrentSystemMessage(messages)?.sections?.cwd;
+  const requested = section ? CWD_SECTION.exec(section)?.[1] : undefined;
+  if (requested === undefined) return { cwd: process.cwd() };
+  if (!isAbsolute(requested)) {
+    return { cwd: process.cwd(), rejected: { cwd: requested, reason: "not-absolute" } };
+  }
+  const isDirectory = await stat(requested).then(
+    (stats) => stats.isDirectory(),
+    () => false,
+  );
+  if (!isDirectory) {
+    return { cwd: process.cwd(), rejected: { cwd: requested, reason: "not-a-directory" } };
+  }
+  return { cwd: requested };
+}
+
 export function streamClaudeCode(
   model: Model<any>,
   sourceContext: TranscriptContext,
@@ -363,17 +401,33 @@ export function streamClaudeCode(
       const frames = prepareFrames(transcript.messages);
       const initialSystemMessages = getInitialSystemMessages(transcript.messages);
       const preparedTools = prepareTools(tools);
+      // Claude Code otherwise caps output at its own default, far below the model's limit.
+      const maxTokens = options?.maxTokens ?? (model.maxTokens > 0 ? model.maxTokens : undefined);
       const extraBody = buildExtraBody(
         model.id,
         nativeTranscript?.requestTools ?? preparedTools.nativeTools,
-        options,
+        { ...options, maxTokens },
       );
-      const translator = new EventTranslator(model, output, stream);
+      const translator = new EventTranslator(
+        model,
+        output,
+        stream,
+        new Map(preparedTools.manifest.map((entry) => [entry.name, entry.inputSchema])),
+      );
+
+      const sessionCwd = await resolveSessionCwd(sourceContext.messages);
+      if (sessionCwd.rejected) {
+        appendAssistantMessageDiagnostic(output, {
+          type: "claude-code.cwd-fallback",
+          timestamp: Date.now(),
+          details: { ...sessionCwd.rejected, fallback: sessionCwd.cwd },
+        });
+      }
 
       stream.push({ type: "start", partial: output });
       const response = await runClaudeRequest({
         model: nativeModel(model.id),
-        cwd: process.cwd(),
+        cwd: sessionCwd.cwd,
         frames,
         systemPrompt,
         manifest: preparedTools.manifest,

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { delimiter, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
+import { once } from "node:events";
 import { spawn, type ChildProcess } from "node:child_process";
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { TurnRelay } from "./turn-relay.ts";
@@ -619,6 +620,10 @@ function processEnvironment(
     DISABLE_FEEDBACK_COMMAND: "1",
     CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1",
     CLAUDE_CODE_DISABLE_FILE_MENTIONS: "1",
+    // Claude Code would otherwise add attachment notes (such as an "@-mentioned"
+    // notice for any @token) to its native system messages, which the relay
+    // records and replays.
+    CLAUDE_CODE_DISABLE_ATTACHMENTS: "1",
     // Claude Code would add these as reminders to user messages and tool
     // results. The relay also strips anything else it adds there.
     CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
@@ -642,17 +647,21 @@ function processEnvironment(
 }
 
 /** Writes a frame stamped with a fresh uuid, which Claude Code echoes back on that frame's result. */
-async function writeFrame(child: ChildProcess, frame: NativeFrame): Promise<string> {
+export async function writeFrame(child: ChildProcess, frame: NativeFrame): Promise<string> {
   if (!child.stdin?.writable) throw new Error("Claude Code stdin closed during history replay");
   const uuid = randomUUID();
   if (!child.stdin.write(`${JSON.stringify({ ...frame, uuid })}\n`)) {
-    await new Promise<void>((resolve, reject) => {
-      child.stdin!.once("drain", resolve);
-      child.stdin!.once("error", reject);
-    });
+    // `once` rejects on "error" and removes both listeners whichever event wins.
+    await once(child.stdin, "drain");
   }
   return uuid;
 }
+
+/**
+ * Anthropic error types that stand for a server-side failure (HTTP 500 and 529).
+ * Sent as an error event inside a 200 stream, they are as transient as the status.
+ */
+const SERVER_STREAM_ERROR_TYPES = new Set(["api_error", "overloaded_error"]);
 
 /** True when the result names user messages and this turn's frame is not one of them. */
 function resultIsForAnotherMessage(result: NativeResult, uuid: string): boolean {
@@ -682,6 +691,7 @@ function withoutCacheControl(value: unknown): unknown {
 interface NativeRequestMessage {
   role?: string;
   content?: unknown;
+  output_config?: unknown;
 }
 
 function requestMessages(body: Buffer | undefined): NativeRequestMessage[] | undefined {
@@ -745,18 +755,82 @@ function setReplayCacheBreakpoints(messages: NativeRequestMessage[]): void {
   const userIndexes = messages
     .map((message, index) => (message.role === "user" ? index : -1))
     .filter((index) => index >= 0);
-  if (userIndexes.length >= 3) {
-    // Claude permits four cache breakpoints. Its two system-prompt markers
-    // consume half of them, so once a prior queried user exists, move the
-    // native environment marker to that exact previous query boundary. This
-    // avoids relying on automatic lookback (notably unreliable with images).
-    for (const message of messages) {
-      if (message.role === "system") message.content = withoutCacheControl(message.content);
-    }
-    setCacheBreakpoint(messages[userIndexes.at(-2)!]!);
+  // Claude permits four cache breakpoints. Its system prompt and tools take
+  // two, so once a prior queried user exists, move the native environment
+  // marker to that exact previous query boundary. This avoids relying on
+  // automatic lookback (notably unreliable with images).
+  const boundary = userIndexes.length >= 3 ? userIndexes.at(-2)! : undefined;
+  const kept = new Set<number>(boundary === undefined ? [] : [boundary]);
+  if (boundary === undefined) {
+    for (let index = 1; messages[index]?.role === "system"; index++) kept.add(index);
   }
-  const final = messages.at(-1);
-  if (final) setCacheBreakpoint(final);
+  // Every other marker goes, e.g. Claude Code's on the last user message once
+  // a trailing system message follows it.
+  messages.forEach((message, index) => {
+    if (!kept.has(index)) message.content = withoutMessageMarkers(message.content);
+  });
+  if (boundary !== undefined) setCacheBreakpoint(messages[boundary]!);
+
+  // The final breakpoint goes on the newest non-system message. A date reminder
+  // after it moves to the new end on the next turn, so a breakpoint on it would
+  // cache a prefix that the next turn cannot read.
+  const finalIndex = messages.findLastIndex((message) => message.role !== "system");
+  for (const message of messages.slice(finalIndex + 1)) {
+    message.content = withoutMessageMarkers(message.content);
+  }
+
+  if (finalIndex >= 0) {
+    setCacheBreakpoint(messages[finalIndex]!);
+  }
+}
+
+const MAX_CACHE_BREAKPOINTS = 4;
+
+/**
+ * The blocks that can carry a breakpoint: message content blocks and the
+ * blocks inside tool results. Tool inputs are the model's arguments, where
+ * `cache_control` is data and stays untouched.
+ */
+function markerBlocks(content: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(content)) return [];
+  return content.flatMap((block) =>
+    isBlock(block) ? [block, ...(block.type === "tool_result" ? markerBlocks(block.content) : [])] : [],
+  );
+}
+
+function countMarkers(blocks: unknown): number {
+  return Array.isArray(blocks) ? blocks.filter((block) => isBlock(block) && "cache_control" in block).length : 0;
+}
+
+function countMessageMarkers(messages: NativeRequestMessage[]): number {
+  return messages.reduce((sum, message) => sum + countMarkers(markerBlocks(message.content)), 0);
+}
+
+function withoutMessageMarkers(content: unknown): unknown {
+  if (!Array.isArray(content)) return content;
+  return content.map((block) => {
+    if (!isBlock(block)) return block;
+    const { cache_control: _marker, ...rest } = block;
+    if (rest.type === "tool_result") rest.content = withoutMessageMarkers(rest.content);
+    return rest;
+  });
+}
+
+/**
+ * Last guard: more than four markers is a 400 that kills the turn, while a
+ * dropped marker only costs cache reuse. Drop message markers oldest first,
+ * keeping the newest marked message's.
+ */
+function capCacheBreakpoints(payload: { tools?: unknown; system?: unknown; messages?: NativeRequestMessage[] }): void {
+  const messages = payload.messages ?? [];
+  let total = countMarkers(payload.tools) + countMarkers(payload.system) + countMessageMarkers(messages);
+  const newest = messages.findLastIndex((message) => countMessageMarkers([message]) > 0);
+  for (let index = 0; index < newest && total > MAX_CACHE_BREAKPOINTS; index++) {
+    const markers = countMessageMarkers([messages[index]!]);
+    if (!markers) continue;
+    messages[index] = { ...messages[index], content: withoutMessageMarkers(messages[index]!.content) };
+    total -= markers;
+  }
 }
 
 type ContentBlock = Record<string, unknown>;
@@ -775,19 +849,47 @@ function isImageScaleNote(block: unknown): boolean {
   );
 }
 
+/** Claude Code's note in place of an image it removed to keep the request under its media limits. */
+function isMediaRemovedNote(block: unknown): boolean {
+  return (
+    isBlock(block) &&
+    block.type === "text" &&
+    typeof block.text === "string" &&
+    block.text.startsWith("[media removed: request limit.")
+  );
+}
+
+function countImages(blocks: unknown[]): number {
+  return blocks.filter((block) => isBlock(block) && block.type === "image").length;
+}
+
 /**
  * Rebuild native user content from Pi's canonical blocks. Claude Code adds
  * reminders (auto-memory, account context, attachments) to user messages and
  * appends them to tool-result text; none of that is Pi history. Canonical
  * blocks are matched in order to Claude Code's blocks by type, and anything
  * Claude Code added is dropped. Images are the exception: Claude Code may
- * downscale them and add a coordinate note, so its copies are kept.
+ * downscale them and add a coordinate note, so its copies are kept. In a long
+ * session it also removes the oldest images to fit its media limits; those
+ * stay removed (sending them back would only hit the same limit), along with
+ * the note Claude Code leaves in their place.
  */
 function alignCanonicalContent(canonical: unknown[], wire: unknown[], where: string): unknown[] {
   const output: unknown[] = [];
   let cursor = 0;
-  for (const block of canonical) {
+  // Claude Code removes oldest first, so the missing images are the leading ones.
+  let removedImages = Math.max(0, countImages(canonical) - countImages(wire));
+  for (const [blockIndex, block] of canonical.entries()) {
     if (!isBlock(block)) throw new Error(`Claude Code request has an invalid canonical block in ${where}`);
+    if (block.type === "image" && removedImages > 0) {
+      removedImages -= 1;
+      const note = wire.findIndex((candidate, position) => position >= cursor && isMediaRemovedNote(candidate));
+      if (note >= 0) {
+        output.push(withoutCacheControl(wire[note]));
+        cursor = note + 1;
+      }
+      continue;
+    }
     const index = wire.findIndex(
       (candidate, position) =>
         position >= cursor &&
@@ -801,7 +903,11 @@ function alignCanonicalContent(canonical: unknown[], wire: unknown[], where: str
 
     if (block.type === "image") {
       output.push(withoutCacheControl(native));
-      if (isImageScaleNote(wire[cursor])) output.push(withoutCacheControl(wire[cursor++]));
+      // Pi writes its own note after images it resized; that note is canonical
+      // and is matched as ordinary text below, not taken as Claude Code's.
+      if (isImageScaleNote(wire[cursor]) && !isImageScaleNote(canonical[blockIndex + 1])) {
+        output.push(withoutCacheControl(wire[cursor++]));
+      }
     } else if (block.type === "tool_result" && Array.isArray(block.content) && Array.isArray(native.content)) {
       output.push({ ...structuredClone(block), content: alignCanonicalContent(block.content, native.content, where) });
     } else {
@@ -879,6 +985,91 @@ function normalizeLeadingSystemCache(system: unknown): void {
   }
 }
 
+/** Index after the system messages that follow the first user message. */
+function leadingSystemEnd(messages: NativeRequestMessage[]): number {
+  let end = 1;
+  while (messages[end]?.role === "system") end += 1;
+
+  return end;
+}
+
+/** The text of the system messages that follow the first user message. */
+function leadingSystemText(messages: NativeRequestMessage[]): string {
+  return messages
+    .slice(1, leadingSystemEnd(messages))
+    .map((message) => contentText(message.content))
+    .join("\n");
+}
+
+/**
+ * Drop later system messages that only repeat the leading ones. Claude Code
+ * appends a date reminder after the newest message when it replays a history,
+ * but a warm process does not have it at that position. Kept anywhere past the
+ * leading block, the copy changes the request prefix between turns and the
+ * prompt cache misses. The leading environment message already carries it.
+ */
+function withoutRepeatedSystemMessages(messages: NativeRequestMessage[]): NativeRequestMessage[] {
+  const leadingEnd = leadingSystemEnd(messages);
+  const leadingText = leadingSystemText(messages);
+
+  return messages.filter((message, index) => {
+    if (index < leadingEnd || message.role !== "system") {
+      return true;
+    }
+
+    const text = contentText(message.content);
+
+    return !text || !leadingText.includes(text);
+  });
+}
+
+const DATE_REMINDER = /^Today's date is \d{4}-\d{2}-\d{2}\.$/u;
+
+/** The text of a block that holds only Claude Code's date reminder. */
+function dateReminderText(block: unknown): string | undefined {
+  const text = isBlock(block) && block.type === "text" && typeof block.text === "string" ? block.text.trim() : "";
+
+  return DATE_REMINDER.test(text) ? text : undefined;
+}
+
+/**
+ * Move Claude Code's newest date reminder to the end of the request. After the
+ * date changes, the reminder no longer repeats the leading block, and a warm
+ * process keeps it where its previous request ended while a fresh one appends
+ * it after the newest message. At the end, after the final cache breakpoint,
+ * both layouts share the prefix and the model still learns the new date.
+ * Older date reminders past the leading block, and one that repeats the
+ * leading block, are dropped.
+ */
+function withDateReminderAtEnd(messages: NativeRequestMessage[]): NativeRequestMessage[] {
+  const leadingEnd = leadingSystemEnd(messages);
+  const dates: string[] = [];
+  const output = messages.flatMap((message, index) => {
+    const blocks = typeof message.content === "string" ? [{ type: "text", text: message.content }] : message.content;
+
+    if (index < leadingEnd || message.role !== "system" || !Array.isArray(blocks)) {
+      return [message];
+    }
+
+    const rest = blocks.filter((block) => dateReminderText(block) === undefined);
+    dates.push(...blocks.map(dateReminderText).filter((date) => date !== undefined));
+
+    if (rest.length === blocks.length) {
+      return [message];
+    }
+
+    return rest.length ? [{ ...message, content: rest }] : [];
+  });
+
+  const newest = dates.at(-1);
+
+  if (!newest || leadingSystemText(messages).includes(newest)) {
+    return output;
+  }
+
+  return [...output, { role: "system", content: newest }];
+}
+
 export function rewriteInitialRequest(
   body: Buffer,
   frames: NativeFrame[],
@@ -888,6 +1079,7 @@ export function rewriteInitialRequest(
   const payload = JSON.parse(body.toString("utf8")) as {
     messages?: NativeRequestMessage[];
     system?: unknown;
+    tools?: unknown;
   };
   let messages = payload.messages;
   const first = messages?.[0];
@@ -899,15 +1091,23 @@ export function rewriteInitialRequest(
   if (initialSystemMessages?.length && messages) {
     let systemEnd = 1;
     while (messages[systemEnd]?.role === "system") systemEnd += 1;
-    messages.splice(1, systemEnd - 1, ...(structuredClone(initialSystemMessages) as NativeRequestMessage[]));
-
-    const initialText = initialSystemMessages
-      .map((message) => contentText((message as NativeRequestMessage).content))
-      .join("\n");
-    while (messages.at(-1)?.role === "system") {
-      const trailingText = contentText(messages.at(-1)?.content);
-      if (!trailingText || !initialText.includes(trailingText)) break;
-      messages.pop();
+    const restored = structuredClone(initialSystemMessages) as NativeRequestMessage[];
+    // Historical per-turn effort requires native replay's beta; fallback only restores the reminders.
+    if (!nativeSystemInjections) for (const message of restored) delete message.output_config;
+    messages.splice(1, systemEnd - 1, ...restored);
+  }
+  if (messages) {
+    const marker = messages.flatMap((message) => markerBlocks(message.content)).findLast((block) => block.cache_control)
+      ?.cache_control;
+    messages = withDateReminderAtEnd(withoutRepeatedSystemMessages(messages));
+    payload.messages = messages;
+    // Claude Code may have put its only message marker on a dropped date reminder;
+    // move it, TTL unchanged, to the newest non-system message.
+    const last = messages.findLast((message) => message.role !== "system");
+    if (marker && !countMessageMarkers(messages) && last) {
+      if (typeof last.content === "string") last.content = [{ type: "text", text: last.content }];
+      const block = Array.isArray(last.content) ? last.content.at(-1) : undefined;
+      if (isBlock(block)) block.cache_control = marker;
     }
   }
 
@@ -917,6 +1117,7 @@ export function rewriteInitialRequest(
     normalizeLeadingSystemCache(payload.system);
   }
   if (initialSystemMessages?.length || nativeSystemInjections) setReplayCacheBreakpoints(messages!);
+  capCacheBreakpoints(payload);
 
   return Buffer.from(JSON.stringify(payload));
 }
@@ -1151,11 +1352,17 @@ class ClaudeProcess {
     input.signal?.throwIfAborted();
 
     let sawMessageStop = false;
+    let consumerError: { error: unknown } | undefined;
     this.delivered = false;
     const deliver = (event: AnthropicStreamEvent) => {
       this.delivered = true;
       if (event.type === "message_stop") sawMessageStop = true;
-      input.onEvent?.(event);
+      try {
+        input.onEvent?.(event);
+      } catch (error) {
+        consumerError ??= { error };
+        throw error;
+      }
     };
     this.relay.beginTurn(
       deliver,
@@ -1214,6 +1421,7 @@ class ClaudeProcess {
       }
       await this.relay.settled();
       input.signal?.throwIfAborted();
+      if (consumerError) throw consumerError.error;
 
       let message: NativeMessage | undefined;
       if (this.relay.used) {
@@ -1233,8 +1441,13 @@ class ClaudeProcess {
             // The connection to Anthropic failed before any response status.
             throw new Error(`Claude Code upstream connection lost before a response (${detail})`);
           }
-          if (this.relay.status !== undefined && this.relay.status >= 500) {
-            // 5xx such as 529 (overloaded) are transient regardless of the body.
+          const streamErrorType = this.relay.capture.errorType;
+          if (
+            (this.relay.status !== undefined && this.relay.status >= 500) ||
+            (streamErrorType !== undefined && SERVER_STREAM_ERROR_TYPES.has(streamErrorType))
+          ) {
+            // 5xx such as 529 (overloaded) are transient regardless of the body, and so
+            // is the same failure reported as an error event in a 200 stream.
             throw new Error(`Claude Code upstream server error (${detail})`);
           }
           throw new Error(`Incomplete Claude Code upstream response (${detail})`);
@@ -1286,6 +1499,9 @@ class ClaudeProcess {
           input.initialSystemMessages ?? deriveInitialSystemMessages(this.relay.originalRequestBody),
         rateLimit,
       };
+    } catch (error) {
+      // The relay records callback throws as capture failures; preserve the original consumer error.
+      throw consumerError ? consumerError.error : error;
     } finally {
       input.signal?.removeEventListener("abort", abort);
       this.relay.finishTurn();

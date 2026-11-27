@@ -55,6 +55,17 @@ ask for usage credits (for example third-party app classification) are
 rewritten into the same kind of error. The latest rate-limit status is attached
 to the assistant message as a `claude-code.rate-limit` diagnostic.
 
+## Working directory
+
+Claude Code tells the model the directory it was started in. Pi does not pass
+the session cwd to providers, so each request reads it from the `cwd` section
+of Pi's structured system prompt and starts Claude Code there. This keeps
+sessions created with `createAgentSession({ cwd })` in one Pi process in their
+own directories. The section is read by name, so `<cwd>` text elsewhere in the
+prompt is ignored. Without the section, or when it does not name an existing
+absolute directory, workers use Pi's process cwd; an unusable section adds a
+`claude-code.cwd-fallback` diagnostic to the assistant message.
+
 ## Process reuse
 
 Linear conversations may reuse a warm Claude Code process. Only exact linear
@@ -84,10 +95,12 @@ tool execution. In particular, it:
   account email, attachments). The relay matches Pi's blocks to Claude Code's
   in order and drops the rest. It keeps Claude Code's copies of images, because
   it may have downscaled them and added a note on how to map coordinates back
-  to the original. Workers also disable auto-memory, CLAUDE.md loading, and
-  the silent-turn reminder, so those reminders are not created in the first
-  place. If a request no longer lines up with Pi's history, the turn fails
-  rather than sending a guess;
+  to the original. Workers also disable auto-memory, CLAUDE.md loading,
+  attachments, and the silent-turn reminder, so those reminders are not
+  created in the first place. Attachments matter because Claude Code puts some
+  of them, such as the "@-mentioned" notice for any `@token` in Pi's text, into
+  its native system messages rather than user messages. If a request no longer
+  lines up with Pi's history, the turn fails rather than sending a guess;
 - relies on replayed assistant frames carrying the model that answered
   (`responseModel`, recorded from `message_start`, else Pi's stored
   `message.model`). Claude Code drops signed thinking from replayed turns it
@@ -98,9 +111,12 @@ tool execution. In particular, it:
   changes this: requests carry no thinking in their history and runs take
   more, smaller steps;
 - records Claude Code's initial native system messages (environment, date),
-  then restores their stable layout during full-history replay. It also adjusts
-  cache breakpoints so tool rounds do not continually invalidate the
-  prompt-cache prefix;
+  then restores their stable layout during full-history replay. When the date
+  changes during a session, it moves the newest date reminder to the end of the
+  request and drops older ones, so warm and fresh turns share a prefix. It also
+  adjusts cache breakpoints so tool rounds do not continually invalidate the
+  prompt-cache prefix, and keeps the final breakpoint off trailing system
+  messages;
 - injects supported mid-conversation tool additions and removals at their
   original assistant boundaries and adds the corresponding Anthropic beta
   header; and

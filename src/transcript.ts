@@ -17,6 +17,36 @@ import { supportsAdaptiveThinking, supportsDisabledThinking } from "./model-cata
 import type { NativeContentBlock, NativeFrame, NativeMessage } from "./native-types.ts";
 
 export const TOOL_PREFIX = "mcp__pi__";
+
+/** Declared Pi tool names (a set, or a map keyed by name). */
+type ToolNames = ReadonlySet<string> | ReadonlyMap<string, unknown>;
+
+/**
+ * Map a tool_use name from Claude Code to Pi's tool name. The model sometimes drops the MCP prefix
+ * ("powershell" for "mcp__pi__powershell") or changes case ("Bash"): exact match first, then a unique
+ * case-insensitive match. Unknown names retain upstream behavior (only the exact prefix is stripped),
+ * so Pi answers "Tool X not found"
+ * and the model can correct itself, instead of the whole turn failing.
+ */
+export function resolveToolName(nativeName: string, toolNames: ToolNames): { name: string; known: boolean } {
+  const prefixed = nativeName.slice(0, TOOL_PREFIX.length).toLowerCase() === TOOL_PREFIX;
+  const stripped = prefixed ? nativeName.slice(TOOL_PREFIX.length) : nativeName;
+  if (toolNames.has(stripped)) return { name: stripped, known: true };
+  const folded = stripped.toLowerCase();
+  const matches = [...toolNames.keys()].filter((name) => name.toLowerCase() === folded);
+  if (matches.length === 1) return { name: matches[0]!, known: true };
+  return { name: nativeName.startsWith(TOOL_PREFIX) ? nativeName.slice(TOOL_PREFIX.length) : nativeName, known: false };
+}
+
+/** Rewrite known tool_use names to their declared native form so history replays the name the API was given. */
+export function canonicalizeToolUseNames(message: NativeMessage, toolNames: ToolNames): void {
+  for (const block of message.content) {
+    if (block.type !== "tool_use") continue;
+    const resolved = resolveToolName(block.name, toolNames);
+    if (resolved.known) block.name = `${TOOL_PREFIX}${resolved.name}`;
+  }
+}
+
 export const NATIVE_REPLAY_DIAGNOSTIC = "claude-code.native-assistant.v1";
 export const NATIVE_TOOL_CHANGES_BETA = "mid-conversation-tool-changes-2026-07-01";
 
@@ -197,7 +227,9 @@ function userContent(content: string | (TextContent | ImageContent)[]): unknown[
 
 function toolResultContent(message: ToolResultMessage): string | unknown[] {
   const hasImages = message.content.some((block) => block.type === "image");
-  if (!hasImages) {
+  // Claude Code drops images from error results and merges their text, so a
+  // canonical copy with images could never be matched against its request.
+  if (!hasImages || message.isError) {
     return sanitizeSurrogates(
       message.content
         .filter((block): block is TextContent => block.type === "text")
@@ -237,7 +269,30 @@ function canonicalAssistantContent(message: AssistantMessage): NativeContentBloc
   return blocks;
 }
 
+/** Claude Code's placeholder text for a turn that ended with no text or thinking. */
+const NO_CONTENT_PLACEHOLDER = "(no content)";
+
+/**
+ * Claude Code drops an assistant turn whose only block is empty or its
+ * placeholder text, and merges the user messages around it. Skip such a turn
+ * so the frames merge the same way.
+ */
+function isDroppedAssistantContent(blocks: NativeContentBlock[]): boolean {
+  if (blocks.length !== 1) return blocks.length === 0;
+  const block = blocks[0] as { type?: string; text?: unknown };
+  return (
+    block.type === "text" &&
+    typeof block.text === "string" &&
+    (block.text.trim() === "" || block.text === NO_CONTENT_PLACEHOLDER)
+  );
+}
+
 function assistantContent(message: AssistantMessage): NativeContentBlock[] {
+  const blocks = replayableAssistantContent(message);
+  return isDroppedAssistantContent(blocks) ? [] : blocks;
+}
+
+function replayableAssistantContent(message: AssistantMessage): NativeContentBlock[] {
   const carrier = replayCarrier(message);
   if (carrier && projectionsEqual(assistantProjection(message), carrier.projection)) {
     return clone(carrier.message.content);
@@ -289,6 +344,13 @@ export function prepareFrames(messages: Message[]): NativeFrame[] {
     if (blocks.length === 0) continue;
     const previous = frames.at(-1);
     if (role === "user" && previous?.type === "user") {
+      // Keep adjacent texts of merged messages apart so the model doesn't read
+      // them as one word. A separate blank block would be dropped by Claude Code.
+      const last = previous.message.content.at(-1) as { type?: string } | undefined;
+      const first = blocks[0] as { type?: string; text?: unknown };
+      if (last?.type === "text" && first.type === "text" && typeof first.text === "string" && !/^\s/u.test(first.text)) {
+        blocks[0] = { ...first, text: `\n\n${first.text}` };
+      }
       previous.message.content.push(...blocks);
     } else {
       frames.push({ type: role, message: { role, content: blocks, ...(model && { model }) } });
@@ -340,6 +402,34 @@ export function normalizeInputSchema(schema: unknown): Record<string, unknown> {
     normalized.properties = {};
   }
   return normalized;
+}
+
+/**
+ * A model sometimes sends an array- or object-typed argument as a JSON-encoded
+ * string (`{"questions": "[{...}]"}`). Pi stores the raw arguments in the session,
+ * and renderers read them unvalidated, so a string where the schema declares an
+ * array or object crashes the TUI on every re-render. Parse such a value back
+ * when, and only when, it parses to the declared type.
+ */
+export function coerceStringifiedArguments<T>(args: T, schema: Record<string, unknown> | undefined): T {
+  const properties = schema?.properties;
+  if (!args || typeof args !== "object" || Array.isArray(args) || !properties || typeof properties !== "object") {
+    return args;
+  }
+  let result: Record<string, unknown> | undefined;
+  for (const [key, value] of Object.entries(args as Record<string, unknown>)) {
+    if (typeof value !== "string") continue;
+    const declared = (properties as Record<string, { type?: unknown } | undefined>)[key]?.type;
+    if (declared !== "array" && declared !== "object") continue;
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      const matches = declared === "array" ? Array.isArray(parsed) : !!parsed && typeof parsed === "object" && !Array.isArray(parsed);
+      if (matches) (result ??= { ...(args as Record<string, unknown>) })[key] = parsed;
+    } catch {
+      // Not JSON: leave the value for the tool's own validation to reject.
+    }
+  }
+  return (result ?? args) as T;
 }
 
 export interface ToolManifestEntry {

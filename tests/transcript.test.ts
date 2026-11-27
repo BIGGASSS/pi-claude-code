@@ -74,6 +74,104 @@ test("prepares replay frames and groups tool results", () => {
   assert.equal(frames[2]?.shouldQuery, undefined);
 });
 
+test("sends error tool results as text only because Claude Code drops their images", () => {
+  const image = { type: "image" as const, data: "shot", mimeType: "image/png" };
+  const call: AssistantMessage = {
+    role: "assistant",
+    api: "test",
+    provider: "claude-code",
+    model: "sonnet",
+    content: [
+      { type: "toolCall", id: "t1", name: "codemode", arguments: {} },
+      { type: "toolCall", id: "t2", name: "codemode", arguments: {} },
+    ],
+    usage,
+    stopReason: "toolUse",
+    timestamp: 1,
+  };
+  const result = (id: string, isError: boolean): Message => ({
+    role: "toolResult",
+    toolCallId: id,
+    toolName: "codemode",
+    content: [{ type: "text", text: "Output:" }, image, { type: "text", text: "Script error" }],
+    isError,
+    timestamp: 2,
+  });
+  const frames = prepareFrames([{ role: "user", content: "inspect", timestamp: 1 }, call, result("t1", true), result("t2", false)]);
+  const [failed, succeeded] = frames[2]!.message.content as Array<{ content: unknown; is_error: boolean }>;
+  assert.deepEqual(failed, { type: "tool_result", tool_use_id: "t1", content: "Output:\nScript error", is_error: true });
+  assert.equal((succeeded!.content as unknown[]).length, 3);
+});
+
+test("skips assistant turns Claude Code drops and merges the user messages around them", () => {
+  const reply = (text: string, timestamp: number): AssistantMessage => ({
+    role: "assistant",
+    api: "claude-code-stream-json",
+    provider: "claude-code",
+    model: "claude-sonnet-5-5",
+    content: [{ type: "text", text }],
+    usage,
+    stopReason: "stop",
+    timestamp,
+  });
+  const call: AssistantMessage = {
+    ...reply("", 3),
+    content: [{ type: "toolCall", id: "t1", name: "wait", arguments: {} }],
+    stopReason: "toolUse",
+  };
+  const frames = prepareFrames([
+    { role: "user", content: "say nothing", timestamp: 1 },
+    reply("(no content)", 2),
+    { role: "user", content: "wait for the others", timestamp: 2 },
+    call,
+    { role: "toolResult", toolCallId: "t1", toolName: "wait", content: [{ type: "text", text: "done" }], isError: false, timestamp: 4 },
+    reply("(no content)", 5),
+    { role: "user", content: "now say hi", timestamp: 6 },
+    reply("  ", 7),
+    { role: "user", content: "again", timestamp: 8 },
+  ]);
+  assert.deepEqual(
+    frames.map((frame) => frame.type),
+    ["user", "assistant", "user"],
+  );
+  assert.equal(frames[0]!.message.content.length, 2);
+  assert.deepEqual(
+    (frames[2]!.message.content as Array<{ type: string }>).map((block) => block.type),
+    ["tool_result", "text", "text"],
+  );
+});
+
+test("keeps consecutive user texts apart when they share one native message", () => {
+  const frames = prepareFrames([
+    { role: "user", content: "list /tmp/foo", timestamp: 0 },
+    { role: "user", content: [{ type: "text", text: "status: 3 notes" }], timestamp: 1 },
+  ]);
+  assert.equal(frames.length, 1);
+  const texts = frames[0]!.message.content.map((block) => (block as { text: string }).text);
+  assert.deepEqual(texts, ["list /tmp/foo", "\n\nstatus: 3 notes"]);
+});
+
+test("keeps user texts apart when a dropped assistant turn merges them", () => {
+  const frames = prepareFrames([
+    { role: "user", content: "say nothing", timestamp: 1 },
+    {
+      role: "assistant",
+      api: "claude-code-stream-json",
+      provider: "claude-code",
+      model: "claude-sonnet-5-5",
+      content: [{ type: "text", text: "(no content)" }],
+      usage,
+      stopReason: "stop",
+      timestamp: 2,
+    },
+    { role: "user", content: "now say hi", timestamp: 3 },
+  ]);
+  assert.deepEqual(frames[0]!.message.content, [
+    { type: "text", text: "say nothing" },
+    { type: "text", text: "\n\nnow say hi" },
+  ]);
+});
+
 test("replays native signed blocks only while the visible projection is unchanged", () => {
   const assistant: AssistantMessage = {
     role: "assistant",

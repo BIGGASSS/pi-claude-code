@@ -1,6 +1,7 @@
 import * as http from "node:http";
 import * as https from "node:https";
 import { randomBytes } from "node:crypto";
+import * as net from "node:net";
 import type { AddressInfo } from "node:net";
 import type { AnthropicStreamEvent, NativeContentBlock, NativeMessage } from "./native-types.ts";
 
@@ -13,6 +14,8 @@ export class AnthropicCapture {
   complete = false;
   /** Error reported inside an otherwise successful (HTTP 200) event stream. */
   error?: string;
+  /** The `error.type` of that stream error, such as `overloaded_error`. */
+  errorType?: string;
   private pending = "";
   private readonly decoder = new TextDecoder();
   private readonly argumentsByIndex = new Map<number, string>();
@@ -88,6 +91,7 @@ export class AnthropicCapture {
         break;
       case "error": {
         const { type, message } = event.error ?? {};
+        this.errorType = type;
         this.error = [type, message].filter(Boolean).join(": ") || "unknown stream error";
         break;
       }
@@ -110,6 +114,15 @@ const STRIPPED_REQUEST_HEADERS = new Set([
 ]);
 
 const STRIPPED_RESPONSE_HEADERS = new Set(["connection", "transfer-encoding", "server", "date"]);
+
+/**
+ * Per-address connect budget for Node's Happy Eyeballs. The 250 ms default abandons IPv4 handshakes that
+ * need a retransmitted SYN; api.anthropic.com has a single IPv4 address, so on hosts without an IPv6 route
+ * the request then fails with AggregateError [ETIMEDOUT, ENETUNREACH]. 5 s covers two SYN retransmissions
+ * (~1 s and ~3 s). A larger process default, e.g. from --network-family-autoselection-attempt-timeout, is kept.
+ * https://github.com/nodejs/node/issues/54359
+ */
+const MIN_CONNECT_ATTEMPT_TIMEOUT_MS = 5_000;
 
 /**
  * Describe a relay failure without losing what Node puts outside `message`:
@@ -303,7 +316,7 @@ export class TurnRelay {
 
       const pathPrefix = this.upstream.pathname.replace(/\/$/u, "");
       const transport = this.upstream.protocol === "https:" ? https : http;
-      upstreamRequest = transport.request({
+      const options: https.RequestOptions & Pick<net.TcpNetConnectOpts, "autoSelectFamilyAttemptTimeout"> = {
         protocol: this.upstream.protocol,
         hostname: this.upstream.hostname,
         port: this.upstream.port || undefined,
@@ -311,7 +324,12 @@ export class TurnRelay {
         path: `${pathPrefix}/v1/messages${requestUrl.search}`,
         headers,
         timeout: this.timeoutMs,
-      });
+        autoSelectFamilyAttemptTimeout: Math.max(
+          MIN_CONNECT_ATTEMPT_TIMEOUT_MS,
+          net.getDefaultAutoSelectFamilyAttemptTimeout(),
+        ),
+      };
+      upstreamRequest = transport.request(options);
       this.sockets.add(upstreamRequest);
 
       const upstreamResponse = await new Promise<http.IncomingMessage>((resolve, reject) => {
