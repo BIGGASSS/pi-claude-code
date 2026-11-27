@@ -498,8 +498,32 @@ function childExit(child: ChildProcess): Promise<number> {
   });
 }
 
+/**
+ * How long a stopped Claude Code tree gets to exit after SIGTERM before SIGKILL.
+ * Claude Code needs the chance to clean up on exit: it deletes its messaging
+ * socket (`$XDG_RUNTIME_DIR/cc-socks/<pid>.sock` or `/tmp/cc-socks*`) on a
+ * normal exit, but SIGKILL leaves one stale socket behind per worker.
+ */
+export const KILL_GRACE_MS = 2_000;
+
+/** Send `signal` to the child's process group, else to the child. False once neither exists. */
+function signalProcessTree(child: ChildProcess, pid: number, signal: NodeJS.Signals): boolean {
+  try {
+    process.kill(-pid, signal);
+    return true;
+  } catch {
+    if (child.exitCode !== null || child.signalCode !== null) return false;
+    try {
+      return child.kill(signal);
+    } catch {
+      // It exited between the checks.
+      return false;
+    }
+  }
+}
+
 export function killProcessTree(child: ChildProcess): void {
-  if (child.exitCode !== null || child.pid === undefined) return;
+  if (child.exitCode !== null || child.signalCode !== null || child.pid === undefined) return;
   if (process.platform === "win32") {
     const killer = spawn("taskkill", ["/F", "/T", "/PID", String(child.pid)], {
       stdio: "ignore",
@@ -508,15 +532,13 @@ export function killProcessTree(child: ChildProcess): void {
     killer.unref();
     return;
   }
-  try {
-    process.kill(-child.pid, "SIGKILL");
-  } catch {
-    try {
-      child.kill("SIGKILL");
-    } catch {
-      // It exited between the checks.
-    }
-  }
+  const pid = child.pid;
+  if (!signalProcessTree(child, pid, "SIGTERM")) return;
+  // Tools Claude Code started share its process group and may outlive it or
+  // ignore SIGTERM, so the group is force-killed after the grace period even
+  // when Claude Code itself has already exited.
+  const force = setTimeout(() => signalProcessTree(child, pid, "SIGKILL"), KILL_GRACE_MS);
+  force.unref?.();
 }
 
 class AsyncQueue<T> {
